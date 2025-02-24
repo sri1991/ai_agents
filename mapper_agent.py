@@ -1,67 +1,122 @@
-import streamlit as st
-from langchain.document_loaders import PyPDFLoader  # Or other loaders
+# Import required libraries
+from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List, Dict
 
-# ------------------ 1. Define the State ------------------
-class GraphState(TypedDict):
-    document_text: str
-    embeddings: List[List[float]]
-    identified_gaps: List[str]
-    report: str
+# Global variables for the knowledge base
+knowledge_base = None
 
-# ------------------ 2. Define the Agents (Nodes) ------------------
-def document_reader(document) -> str:
-    # Load and read the document
-    loader = PyPDFLoader(document) #Example for PDF
-    document = loader.load()
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    texts = text_splitter.split_documents(document)
-    document_text = "".join([doc.page_content for doc in texts])
-    return {"document_text": document_text}
+# Step 1: Ingest the standard policy document into a FAISS index
+def ingest_standard_policy(policy_file: str = "standard_policy.pdf"):
+    global knowledge_base
+    # Load the standard policy document
+    loader = PyPDFLoader(policy_file)
+    documents = loader.load()
 
-def gap_identifier(state: GraphState) -> Dict:
-    # Compare document embeddings to FAISS vector store
-    # Identify gaps
-    # Return identified gaps
-    # Access the vectorstore
-    index = FAISS.load_local("faiss_index", embeddings) #load your Faiss index
-    standards = index.similarity_search(state["document_text"], k=3) #check vectorstore for similar documents
-    #Process the standards and identify the gaps
-    gaps = "These are the gaps from the document" #modify this code
-    return {"identified_gaps": gaps}
+    # Split into smaller chunks
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = text_splitter.split_documents(documents)
 
-def report_generator(state: GraphState) -> Dict:
-    # Format the identified gaps into a report
-    report = f"Report: {state['identified_gaps']}"
-    return {"report": report}
+    # Generate embeddings
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    chunk_texts = [chunk.page_content for chunk in chunks]
+    embeddings = embedder.encode(chunk_texts, convert_to_numpy=True)
 
-# ------------------ 3. Define the Graph ------------------
-def define_graph():
-    builder = StateGraph(GraphState)
-    builder.add_node("document_reader", document_reader)
-    builder.add_node("gap_identifier", gap_identifier)
-    builder.add_node("report_generator", report_generator)
+    # Create FAISS index
+    dimension = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings)
 
-    builder.set_entry_point("document_reader")
-    builder.add_edge("document_reader", "gap_identifier")
-    builder.add_edge("gap_identifier", "report_generator")
-    builder.add_edge("report_generator", END)
+    # Store in global knowledge base
+    knowledge_base = {
+        "index": index,
+        "chunks": chunk_texts,
+        "embeddings": embeddings
+    }
+    print(f"Standard policy ingested with {len(chunks)} chunks.")
 
-    return builder.compile()
+# Step 2: Define the agent's state and workflow
+class AgentState(TypedDict):
+    new_process_chunks: List[str]  # Chunks from the new process document
+    matched_policy_chunks: List[Dict[str, float]]  # Matched policy chunks with similarity scores
+    gaps: List[str]  # Identified gaps
 
-# ------------------ 4. Streamlit App ------------------
-st.title("Process Gap Analyzer")
-embeddings = OpenAIEmbeddings() # your embeddings
-uploaded_file = st.file_uploader("Upload Process Document", type=["pdf", "txt", "docx"])
+# Load and chunk the new process document
+def load_new_process(state: AgentState) -> AgentState:
+    loader = PyPDFLoader("new_process.pdf")
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = text_splitter.split_documents(documents)
+    state["new_process_chunks"] = [chunk.page_content for chunk in chunks]
+    return state
 
-if uploaded_file is not None:
-    graph = define_graph()
-    inputs = {"document": uploaded_file}
-    st.write("Running Graph")
-    result = graph.invoke(inputs)
-    st.write("Gaps Identified:")
-    st.write(result['report']) #display the report
+# Match new process chunks to policy using FAISS
+def match_to_policy(state: AgentState) -> AgentState:
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    new_embeddings = embedder.encode(state["new_process_chunks"], convert_to_numpy=True)
+    distances, indices = knowledge_base["index"].search(new_embeddings, k=1)
+    state["matched_policy_chunks"] = [
+        {"text": knowledge_base["chunks"][idx[0]], "distance": dist[0]}
+        for dist, idx in zip(distances, indices)
+    ]
+    return state
+
+# Identify gaps based on similarity threshold
+def identify_gaps(state: AgentState) -> AgentState:
+    gaps = []
+    threshold = 0.5  # Adjust this threshold as needed
+    for i, (new_chunk, match) in enumerate(zip(state["new_process_chunks"], state["matched_policy_chunks"])):
+        if match["distance"] > threshold:
+            gaps.append(
+                f"Gap in new process chunk {i+1}: '{new_chunk[:50]}...' "
+                f"not covered by policy (closest match: '{match['text'][:50]}...', distance: {match['distance']:.2f})"
+            )
+    state["gaps"] = gaps
+    return state
+
+# Build and compile the workflow
+def create_agent():
+    workflow = StateGraph(AgentState)
+    workflow.add_node("load_new_process", load_new_process)
+    workflow.add_node("match_to_policy", match_to_policy)
+    workflow.add_node("identify_gaps", identify_gaps)
+
+    workflow.add_edge("load_new_process", "match_to_policy")
+    workflow.add_edge("match_to_policy", "identify_gaps")
+    workflow.add_edge("identify_gaps", END)
+
+    workflow.set_entry_point("load_new_process")
+    return workflow.compile()
+
+# Main execution
+def main():
+    # Ingest the standard policy
+    ingest_standard_policy("standard_policy.pdf")
+
+    # Create the agent
+    agent = create_agent()
+
+    # Initial state
+    initial_state = {
+        "new_process_chunks": [],
+        "matched_policy_chunks": [],
+        "gaps": []
+    }
+
+    # Run the agent
+    result = agent.invoke(initial_state)
+
+    # Print results
+    print("\nIdentified Gaps:")
+    if result["gaps"]:
+        for gap in result["gaps"]:
+            print(gap)
+    else:
+        print("No significant gaps identified.")
+
+if __name__ == "__main__":
+    main()
