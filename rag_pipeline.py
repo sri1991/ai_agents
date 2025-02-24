@@ -1,208 +1,269 @@
-from typing import List, Dict, Any
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import GooglePalmEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.document_loaders import TextLoader, DirectoryLoader
+from typing import List, Dict, Any, Annotated
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.graph import Graph, StateGraph
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.chat_models import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate
 from langchain.schema import Document
-import google.generativeai as genai
 import logging
-import os
-from pathlib import Path
+from pydantic import BaseModel
+import streamlit as st
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class RAGPipeline:
-    """
-    RAG Pipeline implementation using FAISS and Google's Gemini
-    """
+class RAGState(BaseModel):
+    """State definition for the RAG pipeline"""
+    messages: List[Any]
+    context: List[Document] = []
+    query: str = ""
+    response: str = ""
+
+class RAGAgent:
+    """RAG Agent using LangGraph for document question answering"""
     
-    def __init__(self, api_key: str, docs_dir: str = "documents"):
+    def __init__(self, vectorstore: FAISS, model_name: str = "gpt-3.5-turbo", temperature: float = 0.7):
         """
-        Initialize the RAG pipeline
+        Initialize the RAG Agent
         
         Args:
-            api_key (str): Google API key
-            docs_dir (str): Directory containing documents to process
+            vectorstore (FAISS): Initialized FAISS vector store
+            model_name (str): Name of the LLM model to use
+            temperature (float): Temperature for LLM responses
         """
-        self.api_key = api_key
-        self.docs_dir = docs_dir
+        self.vectorstore = vectorstore
+        self.llm = ChatOpenAI(model_name=model_name, temperature=temperature)
+        self.graph = self._create_graph()
         
-        # Configure Google AI
-        genai.configure(api_key=api_key)
-        
-        # Initialize LLM
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-1.0-pro",
-            temperature=0.7,
-            google_api_key=api_key
-        )
-        
-        # Initialize embeddings
-        self.embeddings = GooglePalmEmbeddings(
-            google_api_key=api_key
-        )
-        
-        # Initialize text splitter
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
-            length_function=len
-        )
-        
-        # Vector store
-        self.vector_store = None
-
-    def load_documents(self) -> List[Document]:
-        """
-        Load documents from the specified directory
-        
-        Returns:
-            List[Document]: List of loaded documents
-        """
-        logger.info(f"Loading documents from {self.docs_dir}")
-        
-        try:
-            # Create directory if it doesn't exist
-            Path(self.docs_dir).mkdir(parents=True, exist_ok=True)
+        # Define RAG prompt
+        self.prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a helpful AI assistant that answers questions based on the provided context. 
+            Use the context to provide accurate and relevant answers. If the context doesn't contain 
+            enough information to answer the question, acknowledge this and suggest what additional 
+            information might be needed.
             
-            # Load documents from directory
-            loader = DirectoryLoader(
-                self.docs_dir,
-                glob="**/*.txt",
-                loader_cls=TextLoader
-            )
-            documents = loader.load()
-            logger.info(f"Loaded {len(documents)} documents")
-            return documents
-            
-        except Exception as e:
-            logger.error(f"Error loading documents: {str(e)}")
-            return []
-
-    def process_documents(self, documents: List[Document]) -> None:
-        """
-        Process documents and create vector store
-        
-        Args:
-            documents (List[Document]): List of documents to process
-        """
-        logger.info("Processing documents")
-        
-        try:
-            # Split documents into chunks
-            texts = self.text_splitter.split_documents(documents)
-            logger.info(f"Split into {len(texts)} chunks")
-            
-            # Create vector store
-            self.vector_store = FAISS.from_documents(
-                texts,
-                self.embeddings
-            )
-            logger.info("Vector store created successfully")
-            
-        except Exception as e:
-            logger.error(f"Error processing documents: {str(e)}")
-
-    def save_vector_store(self, path: str = "vector_store") -> None:
-        """
-        Save the vector store to disk
-        
-        Args:
-            path (str): Path to save the vector store
-        """
-        if self.vector_store:
-            self.vector_store.save_local(path)
-            logger.info(f"Vector store saved to {path}")
-
-    def load_vector_store(self, path: str = "vector_store") -> None:
-        """
-        Load the vector store from disk
-        
-        Args:
-            path (str): Path to load the vector store from
-        """
-        if os.path.exists(path):
-            self.vector_store = FAISS.load_local(
-                path,
-                self.embeddings
-            )
-            logger.info(f"Vector store loaded from {path}")
-
-    def query(self, query: str, k: int = 3) -> Dict[str, Any]:
-        """
-        Query the RAG pipeline
-        
-        Args:
-            query (str): Query string
-            k (int): Number of relevant documents to retrieve
-            
-        Returns:
-            Dict[str, Any]: Query results including relevant documents and generated response
-        """
-        if not self.vector_store:
-            return {"error": "Vector store not initialized"}
-        
-        try:
-            # Retrieve relevant documents
-            relevant_docs = self.vector_store.similarity_search(query, k=k)
-            
-            # Construct prompt with context
-            context = "\n\n".join([doc.page_content for doc in relevant_docs])
-            prompt = f"""
-            Based on the following context, please answer the question.
-            If the answer cannot be derived from the context, say "I cannot answer this based on the provided context."
-
             Context:
             {context}
+            """),
+            ("human", "{question}")
+        ])
 
-            Question: {query}
-            """
+    def _retrieve(self, state: RAGState) -> RAGState:
+        """
+        Retrieve relevant documents from vector store
+        
+        Args:
+            state (RAGState): Current state
+            
+        Returns:
+            RAGState: Updated state with retrieved documents
+        """
+        try:
+            # Get relevant documents
+            docs = self.vectorstore.similarity_search(state.query, k=3)
+            state.context = docs
+            logger.info(f"Retrieved {len(docs)} documents")
+            return state
+            
+        except Exception as e:
+            logger.error(f"Error in retrieval: {str(e)}")
+            return state
+
+    def _generate_response(self, state: RAGState) -> RAGState:
+        """
+        Generate response using LLM
+        
+        Args:
+            state (RAGState): Current state
+            
+        Returns:
+            RAGState: Updated state with generated response
+        """
+        try:
+            # Prepare context
+            context_text = "\n\n".join([doc.page_content for doc in state.context])
             
             # Generate response
-            response = self.llm.invoke(prompt)
+            chain = self.prompt | self.llm
+            response = chain.invoke({
+                "context": context_text,
+                "question": state.query
+            })
+            
+            state.response = response.content
+            return state
+            
+        except Exception as e:
+            logger.error(f"Error in response generation: {str(e)}")
+            state.response = f"Error generating response: {str(e)}"
+            return state
+
+    def _create_graph(self) -> Graph:
+        """
+        Create the LangGraph processing graph
+        
+        Returns:
+            Graph: Configured processing graph
+        """
+        # Create workflow
+        workflow = StateGraph(RAGState)
+        
+        # Add nodes
+        workflow.add_node("retrieve", self._retrieve)
+        workflow.add_node("generate", self._generate_response)
+        
+        # Add edges
+        workflow.add_edge('retrieve', 'generate')
+        workflow.set_entry_point("retrieve")
+        
+        # Set final node
+        workflow.set_finish_point("generate")
+        
+        return workflow.compile()
+
+    def query(self, question: str) -> Dict[str, Any]:
+        """
+        Process a query through the RAG pipeline
+        
+        Args:
+            question (str): User question
+            
+        Returns:
+            Dict[str, Any]: Query results including response and context
+        """
+        try:
+            # Initialize state
+            initial_state = RAGState(
+                messages=[HumanMessage(content=question)],
+                query=question
+            )
+            
+            # Run the graph
+            result = self.graph.invoke(initial_state)
             
             return {
-                "query": query,
-                "relevant_documents": [doc.page_content for doc in relevant_docs],
-                "response": response.content
+                'query': question,
+                'response': result.response,
+                'context': [
+                    {
+                        'content': doc.page_content,
+                        'source': doc.metadata.get('source', 'Unknown'),
+                        'score': doc.metadata.get('score', None)
+                    }
+                    for doc in result.context
+                ]
             }
             
         except Exception as e:
-            logger.error(f"Error during query: {str(e)}")
-            return {"error": str(e)}
+            logger.error(f"Error processing query: {str(e)}")
+            return {
+                'query': question,
+                'error': str(e),
+                'response': None,
+                'context': []
+            }
+
+class StreamlitRAGApp:
+    """Streamlit interface for RAG Agent"""
+    
+    def __init__(self, vectorstore: FAISS = None):
+        """
+        Initialize the Streamlit RAG application
+        
+        Args:
+            vectorstore (FAISS): Optional pre-initialized vector store
+        """
+        self.setup_streamlit()
+        self.vectorstore = vectorstore
+        self.rag_agent = None
+        
+        if vectorstore:
+            self.initialize_agent()
+    
+    def setup_streamlit(self):
+        """Configure Streamlit page settings"""
+        st.set_page_config(
+            page_title="RAG Query Interface",
+            page_icon="🤖",
+            layout="wide"
+        )
+        
+        st.title("🤖 RAG Query Interface")
+        st.markdown("""
+        Ask questions about your documents using RAG (Retrieval Augmented Generation).
+        The system will:
+        1. Find relevant content from your documents
+        2. Generate an informed response using the context
+        """)
+    
+    def initialize_agent(self):
+        """Initialize the RAG agent"""
+        if not self.vectorstore:
+            st.warning("No vector store available. Please upload documents first.")
+            return False
+            
+        try:
+            self.rag_agent = RAGAgent(self.vectorstore)
+            return True
+        except Exception as e:
+            st.error(f"Error initializing RAG agent: {str(e)}")
+            return False
+    
+    def display_results(self, results: Dict[str, Any]):
+        """
+        Display query results
+        
+        Args:
+            results (Dict[str, Any]): Query results
+        """
+        if 'error' in results:
+            st.error(f"Error: {results['error']}")
+            return
+            
+        # Display response
+        st.subheader("Response")
+        st.write(results['response'])
+        
+        # Display supporting context
+        st.subheader("Supporting Context")
+        for idx, context in enumerate(results['context'], 1):
+            with st.expander(f"Context {idx} - Source: {context['source']}", expanded=False):
+                st.write(context['content'])
+                if context['score']:
+                    st.info(f"Relevance Score: {context['score']:.4f}")
+    
+    def run(self):
+        """Run the Streamlit application"""
+        if not self.vectorstore:
+            st.warning("Please upload and process documents first to create the knowledge base.")
+            return
+            
+        if not self.rag_agent:
+            if not self.initialize_agent():
+                return
+        
+        # Query interface
+        query = st.text_input(
+            "Enter your question:",
+            help="Ask a question about your documents"
+        )
+        
+        if query:
+            with st.spinner("Processing query..."):
+                try:
+                    results = self.rag_agent.query(query)
+                    self.display_results(results)
+                    
+                except Exception as e:
+                    st.error(f"Error processing query: {str(e)}")
 
 def main():
-    """Example usage of the RAG pipeline"""
-    # Replace with your actual API key
-    api_key = "your_google_api_key_here"
-    
-    # Initialize pipeline
-    pipeline = RAGPipeline(api_key)
-    
-    # Load and process documents
-    documents = pipeline.load_documents()
-    if documents:
-        pipeline.process_documents(documents)
-        
-        # Save vector store
-        pipeline.save_vector_store()
-    
-    # Example query
-    query = "What are the main benefits of artificial intelligence in healthcare?"
-    results = pipeline.query(query)
-    
-    # Print results
-    print("\nQuery Results:")
-    print(f"Query: {results['query']}")
-    print("\nRelevant Documents:")
-    for i, doc in enumerate(results.get('relevant_documents', []), 1):
-        print(f"\nDocument {i}:")
-        print(doc)
-    print("\nGenerated Response:")
-    print(results.get('response', 'No response generated'))
+    """Main entry point"""
+    # This would typically be initialized with a vector store from document processing
+    app = StreamlitRAGApp()
+    app.run()
 
 if __name__ == "__main__":
     main() 
