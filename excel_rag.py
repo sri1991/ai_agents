@@ -5,28 +5,19 @@ from langchain.chains import RetrievalQA
 from sentence_transformers import SentenceTransformer
 from langchain.llms import OpenAI  # Replace with your LLM provider
 
-# Step 1: Load Excel and Group Data
-def load_excel_and_group(file_path: str = "input.xlsx", group_by_column: str = "Category"):
+# Step 1: Load Excel and Convert to Documents
+def load_excel_to_documents(file_path: str = "input.xlsx"):
     # Read Excel file
     df = pd.read_excel(file_path)
-    print(f"Loaded Excel with {len(df)} rows.")
     
-    # Group by the specified column
-    grouped = df.groupby(group_by_column)
-    
-    # Convert grouped data into documents
+    # Convert each row to a text document
     documents = []
-    for group_name, group_df in grouped:
-        # Combine content within the group
-        combined_content = "\n".join(
-            f"Section: {row['Section']} | Content: {row['Content']}"
-            for _, row in group_df.iterrows()
-        )
-        text = f"Category: {group_name}\n{combined_content}"
-        metadata = {"category": group_name, "sections": list(group_df["Section"])}
+    for _, row in df.iterrows():
+        # Combine columns into a single string (customize as needed)
+        text = f"Section: {row['Section']} | Content: {row['Content']} | Category: {row['Category']}"
+        metadata = {"section": row["Section"], "category": row["Category"]}
         documents.append(Document(page_content=text, metadata=metadata))
     
-    print(f"Grouped into {len(documents)} documents.")
     return documents
 
 # Step 2: Build Vector Store
@@ -57,14 +48,15 @@ def query_rag(vector_store, query: str, llm):
     sources = result["source_documents"]
     
     # Format output with source details
-    source_info = "\n".join([f"Source: {doc.page_content[:100]}..." for doc in sources])
+    source_info = "\n".join([f"Source: {doc.page_content}" for doc in sources])
     final_answer = f"Answer: {answer}\n\nRetrieved Sources:\n{source_info}"
     return final_answer
 
 # Main Pipeline
 def main():
-    # Load Excel and group data
-    documents = load_excel_and_group("input.xlsx", group_by_column="Category")
+    # Load Excel and convert to documents
+    documents = load_excel_to_documents("input.xlsx")
+    print(f"Loaded {len(documents)} documents from Excel.")
     
     # Build vector store
     vector_store = build_vector_store(documents)
@@ -74,7 +66,7 @@ def main():
     
     # Example queries
     queries = [
-        "What safety-related information is there?",
+        "What sections mention safety?",
         "What is the reporting frequency?",
         "Are there any finance-related processes?"
     ]
