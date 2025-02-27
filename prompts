@@ -1,0 +1,29 @@
+You are an AI assistant tasked with analyzing two documents: a "Standards Document" and a "Process Document." Your goal is to read both documents, map relevant sections from the Process Document to the Standards Document, and identify sections in the Process Document that do not adhere to the standards. Follow these steps:
+
+1. **Read the Standards Document**: Understand its structure, key sections, and the specific requirements or guidelines it outlines. Note section numbers, headings, or identifiers for reference.
+
+2. **Read the Process Document**: Examine its structure and content, identifying sections that describe procedures, steps, or policies.
+
+3. **Map Relevant Sections**: For each section in the Standards Document, find the most relevant section(s) in the Process Document that address or relate to it. If no direct match exists, mark it as "Unaddressed."
+
+4. **Identify Non-Adherence**: Specifically highlight sections in the Process Document that contradict, fail to meet, or deviate from the requirements in the Standards Document. Use **bold text** to emphasize these non-adherent sections in your output.
+
+5. **Provide Output**: Present your findings in two parts:
+   - **Mapping Table**: A table with the following columns:
+     - **Standards Section**: The section number or title from the Standards Document.
+     - **Process Section**: The corresponding section number or title from the Process Document (or "Unaddressed" if no match).
+     - **Details**: A brief explanation of how the Process Document aligns or fails to align with the Standards Document.
+     - **Confidence (Optional)**: A confidence score (0 to 1) reflecting your certainty in the mapping, based on content similarity or clarity.
+   - **Non-Adherence Summary**: A list of Process Document sections that do not adhere to the Standards Document, with explanations.
+
+6. **Handle Ambiguity**: If a Process Document section could map to multiple Standards Document sections, note all possibilities and explain your reasoning.
+
+Here are the documents:
+
+**Standards Document**:  
+[Insert full text or a placeholder like "See attached Standards Document"]
+
+**Process Document**:  
+[Insert full text or a placeholder like "See attached Process Document"]
+
+Output your mapping in this format:  
