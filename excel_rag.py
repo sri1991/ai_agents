@@ -1,81 +1,129 @@
 import pandas as pd
-from langchain.docstore.document import Document
-from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
-from sentence_transformers import SentenceTransformer
-from langchain.llms import OpenAI  # Replace with your LLM provider
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Dict
+from langchain.llms import AzureOpenAI
+from langchain.prompts import PromptTemplate
+import os
 
-# Step 1: Load Excel and Convert to Documents
-def load_excel_to_documents(file_path: str = "input.xlsx"):
-    # Read Excel file
-    df = pd.read_excel(file_path)
-    
-    # Convert each row to a text document
-    documents = []
-    for _, row in df.iterrows():
-        # Combine columns into a single string (customize as needed)
-        text = f"Section: {row['Section']} | Content: {row['Content']} | Category: {row['Category']}"
-        metadata = {"section": row["Section"], "category": row["Category"]}
-        documents.append(Document(page_content=text, metadata=metadata))
-    
-    return documents
+# Step 1: Define the Agent State
+class AgentState(TypedDict):
+    risk_data: pd.DataFrame  # Excel risk definitions
+    process_text: List[str]  # Chunks of process document text
+    risk_mappings: List[Dict]  # Identified risks and mappings
 
-# Step 2: Build Vector Store
-def build_vector_store(documents):
-    # Initialize embedding model
-    embedder = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    # Create FAISS vector store from documents
-    vector_store = FAISS.from_documents(documents, embedder)
-    return vector_store
+# Step 2: Load Excel Risk Definitions
+def load_risk_definitions(state: AgentState) -> AgentState:
+    df = pd.read_excel("risk_definitions.xlsx")
+    state["risk_data"] = df
+    print(f"Loaded {len(df)} risk definitions from Excel.")
+    return state
 
-# Step 3: Query the Data with RAG
-def query_rag(vector_store, query: str, llm):
-    # Set up retriever
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})  # Retrieve top 3 matches
-    
-    # Create QA chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True
+# Step 3: Load and Chunk Process Document
+def load_process_document(state: AgentState) -> AgentState:
+    loader = PyPDFLoader("process_doc.pdf")
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    state["process_text"] = [chunk.page_content for chunk in text_splitter.split_documents(documents)]
+    print(f"Loaded process document with {len(state['process_text'])} chunks.")
+    return state
+
+# Step 4: Identify and Map Risks
+def identify_risks(state: AgentState) -> AgentState:
+    # Initialize Azure OpenAI Chat
+    llm = AzureOpenAI(
+        azure_endpoint="YOUR_AZURE_ENDPOINT",
+        api_key="YOUR_API_KEY",
+        deployment_name="YOUR_DEPLOYMENT_NAME",
+        api_version="2023-05-15",  # Adjust based on your Azure version
+        temperature=0.7
     )
     
-    # Run the query
-    result = qa_chain({"query": query})
-    answer = result["result"]
-    sources = result["source_documents"]
+    # Prepare risk definitions as text
+    risk_text = "\n".join(
+        f"Risk ID: {row['Risk ID']} | Definition: {row['Risk Definition']} | Control: {row['Control Type']} | Mitigation: {row['Mitigation Strategy']}"
+        for _, row in state["risk_data"].iterrows()
+    )
     
-    # Format output with source details
-    source_info = "\n".join([f"Source: {doc.page_content}" for doc in sources])
-    final_answer = f"Answer: {answer}\n\nRetrieved Sources:\n{source_info}"
-    return final_answer
+    # Define prompt for LLM
+    prompt_template = PromptTemplate(
+        input_variables=["risks", "process"],
+        template="""
+        You are an AI advisor analyzing a process document against predefined risk definitions. Your task is to:
+        1. Read the risk definitions below.
+        2. Analyze the process document text.
+        3. Identify risks in the process document and map them to the risk definitions.
+        4. For each identified risk, provide:
+           - The process section where the risk occurs
+           - The matching Risk ID (or "None" if no match)
+           - A brief explanation
+           - A confidence score (0 to 1)
 
-# Main Pipeline
+        **Risk Definitions**:
+        {risks}
+
+        **Process Document**:
+        {process}
+
+        Output your findings in this format:
+        - Process Section: [section text]
+          Risk ID: [id]
+          Explanation: [reasoning]
+          Confidence: [score]
+        """
+    )
+    
+    # Analyze each process chunk
+    mappings = []
+    for chunk in state["process_text"]:
+        prompt = prompt_template.format(risks=risk_text, process=chunk)
+        response = llm(prompt)
+        mappings.append({"chunk": chunk, "mapping": response})
+    
+    state["risk_mappings"] = mappings
+    return state
+
+# Step 5: Build the Workflow
+def create_agent():
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("load_risk_definitions", load_risk_definitions)
+    workflow.add_node("load_process_document", load_process_document)
+    workflow.add_node("identify_risks", identify_risks)
+    
+    # Define edges
+    workflow.add_edge("load_risk_definitions", "load_process_document")
+    workflow.add_edge("load_process_document", "identify_risks")
+    workflow.add_edge("identify_risks", END)
+    
+    # Set entry point
+    workflow.set_entry_point("load_risk_definitions")
+    
+    return workflow.compile()
+
+# Main Execution
 def main():
-    # Load Excel and convert to documents
-    documents = load_excel_to_documents("input.xlsx")
-    print(f"Loaded {len(documents)} documents from Excel.")
+    # Create and run the agent
+    agent = create_agent()
+    initial_state = {
+        "risk_data": None,
+        "process_text": [],
+        "risk_mappings": []
+    }
     
-    # Build vector store
-    vector_store = build_vector_store(documents)
+    result = agent.invoke(initial_state)
     
-    # Initialize LLM (replace with your preferred LLM, e.g., Grok via xAI API)
-    llm = OpenAI(temperature=0.7)  # Placeholder; use xAI API if available
-    
-    # Example queries
-    queries = [
-        "What sections mention safety?",
-        "What is the reporting frequency?",
-        "Are there any finance-related processes?"
-    ]
-    
-    # Process queries
-    for query in queries:
-        print(f"\nQuery: {query}")
-        answer = query_rag(vector_store, query, llm)
-        print(answer)
+    # Print results
+    print("\nRisk Mapping Results:")
+    for mapping in result["risk_mappings"]:
+        print(f"Process Chunk: {mapping['chunk'][:50]}...")
+        print(f"Mapping:\n{mapping['mapping']}\n")
 
 if __name__ == "__main__":
+    # Set Azure OpenAI environment variables (optional, if not hardcoded)
+    os.environ["AZURE_OPENAI_ENDPOINT"] = "YOUR_AZURE_ENDPOINT"
+    os.environ["AZURE_OPENAI_API_KEY"] = "YOUR_API_KEY"
+    
     main()
