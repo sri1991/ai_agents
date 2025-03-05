@@ -119,3 +119,13 @@ if __name__ == "__main__":
     os.environ["AZURE_OPENAI_API_KEY"] = "YOUR_API_KEY"
     
     main()
+
+
+def query_vector_store(state: AgentState) -> AgentState:
+    query = "risk"
+    results = state["vector_store"].similarity_search(query, k=2, filter={"Status": "Active"})
+    state["query_results"] = results
+    print("Query Results:", results)
+    return state
+workflow.add_node("query_vector_store", query_vector_store)
+workflow.add_edge("build_vector_store", "query_vector_store")
