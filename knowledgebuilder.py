@@ -1,44 +1,35 @@
 import pandas as pd
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.docstore.document import Document
 from langchain.vectorstores import FAISS
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Dict
-from openai import AzureOpenAI  # Updated to use openai for embeddings
+from typing import TypedDict, Dict, List, Tuple
+from openai import AzureOpenAI
 import os
 import numpy as np
+from numpy.linalg import norm
 
 # Step 1: Define the Agent State
 class AgentState(TypedDict):
-    excel_data: pd.DataFrame  # Raw Excel data
-    vector_store: FAISS       # FAISS vector store
-    context_column: str       # Column used as context for embedding
-    metadata_columns: list    # Columns to use as metadata
-    documents: list           # Processed documents
+    process_text_chunks: List[str]  # Chunks of process document text
+    user_metadata: Dict            # Metadata provided by the user
+    vector_store: FAISS            # Pre-existing vector store
+    chunk_embeddings: np.ndarray   # Embeddings of process chunks
+    mappings: List[Tuple[str, Document, float]]  # Mapped chunks with documents and scores
 
-# Step 2: Load Excel Data
-def load_excel_data(state: AgentState) -> AgentState:
-    # Load the Excel file
-    df = pd.read_excel("data.xlsx")
-    state["excel_data"] = df
-    state["context_column"] = "Description"  # Define the context column
-    state["metadata_columns"] = ["Category", "Status", "Date"]  # Define metadata columns
-    print(f"Loaded Excel with {len(df)} rows.")
+# Step 2: Load and Chunk Process Document
+def load_and_chunk_process(state: AgentState) -> AgentState:
+    loader = PyPDFLoader("process_doc.pdf")
+    documents = loader.load()
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=50)
+    chunks = [chunk.page_content for chunk in text_splitter.split_documents(documents)]
+    state["process_text_chunks"] = chunks
+    print(f"Chunked process document into {len(chunks)} sections.")
     return state
 
-# Step 3: Convert Excel to Documents with Context and Metadata
-def prepare_documents(state: AgentState) -> AgentState:
-    documents = []
-    for _, row in state["excel_data"].iterrows():
-        context = row[state["context_column"]]  # Context column for embedding
-        metadata = {col: row[col] for col in state["metadata_columns"]}  # Metadata columns
-        documents.append(Document(page_content=context, metadata=metadata))
-    state["documents"] = documents
-    print(f"Prepared {len(documents)} documents with context from '{state['context_column']}'.")
-    return state
-
-# Step 4: Initialize Azure OpenAI Embedding Client
+# Step 3: Initialize Azure OpenAI Embedding Client
 def initialize_embeddings(state: AgentState) -> AgentState:
-    # Azure OpenAI credentials (replace with your values)
     client = AzureOpenAI(
         azure_endpoint="YOUR_AZURE_ENDPOINT",
         api_key="YOUR_API_KEY",
@@ -49,83 +40,122 @@ def initialize_embeddings(state: AgentState) -> AgentState:
     print("Initialized Azure OpenAI embedding client.")
     return state
 
-# Step 5: Generate Embeddings and Build FAISS Vector Store
-def build_vector_store(state: AgentState) -> AgentState:
+# Step 4: Generate Embeddings for Process Chunks
+def generate_chunk_embeddings(state: AgentState) -> AgentState:
     client = state["embedding_client"]
-    documents = state["documents"]
+    chunks = state["process_text_chunks"]
     
-    # Generate embeddings for the context column
-    texts = [doc.page_content for doc in documents]
-    response = client.embeddings.create(input=texts, model="YOUR_EMBEDDING_DEPLOYMENT_NAME")
+    # Generate embeddings
+    response = client.embeddings.create(input=chunks, model="YOUR_EMBEDDING_DEPLOYMENT_NAME")
     embeddings = np.array([item.embedding for item in response.data])
     
-    # Create FAISS index
-    dimension = embeddings.shape[1]
-    index = FAISS.IndexFlatL2(dimension)
-    index.add(embeddings)
-    
-    # Build FAISS vector store with LangChain
-    vector_store = FAISS.from_documents(
-        documents=documents,
-        embedding=lambda x: embeddings[list(texts).index(x)]
-    )
-    state["vector_store"] = vector_store
-    print(f"Built FAISS vector store with {len(documents)} vectors.")
+    # Normalize embeddings for cosine similarity
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    normalized_embeddings = embeddings / norms
+    state["chunk_embeddings"] = normalized_embeddings
+    print(f"Generated embeddings for {len(chunks)} chunks.")
     return state
 
-# Step 6: Build the Workflow
+# Step 5: Load Pre-existing Vector Store (Assume from previous agent)
+def load_vector_store(state: AgentState) -> AgentState:
+    # Load or simulate the pre-existing vector store (replace with actual loading logic)
+    # For this example, we'll assume it's passed or loaded from a file
+    # Placeholder: Use the vector store from the previous agent
+    from previous_agent import AgentState as PrevState, create_agent as prev_create_agent  # Hypothetical import
+    prev_agent = prev_create_agent()
+    prev_result = prev_agent.invoke({"excel_data": pd.read_excel("data.xlsx"), ...})  # Adjust initial state
+    state["vector_store"] = prev_result["vector_store"]
+    print("Loaded pre-existing vector store.")
+    return state
+
+# Step 6: Map Chunks to Vector Store with Metadata Filtering and Threshold
+def map_with_metadata(state: AgentState) -> AgentState:
+    vector_store = state["vector_store"]
+    chunk_embeddings = state["chunk_embeddings"]
+    user_metadata = state["user_metadata"]
+    threshold = 0.85  # Similarity threshold
+    
+    # Get stored embeddings and documents from the vector store
+    stored_embeddings = vector_store.index.reconstruct_n(0, vector_store.index.ntotal)
+    norms = np.linalg.norm(stored_embeddings, axis=1, keepdims=True)
+    normalized_stored_embeddings = stored_embeddings / norms
+    documents = [vector_store.docstore.search(i) for i in range(vector_store.index.ntotal)]
+    
+    # Filter documents based on user metadata
+    filtered_docs = [doc for doc in documents if all(doc.metadata.get(key) == value for key, value in user_metadata.items())]
+    if not filtered_docs:
+        print("No documents match the provided metadata.")
+        state["mappings"] = []
+        return state
+    
+    filtered_indices = [i for i, doc in enumerate(documents) if doc in filtered_docs]
+    filtered_embeddings = normalized_stored_embeddings[filtered_indices]
+    
+    # Compute similarity scores for each chunk against filtered embeddings
+    mappings = []
+    for chunk, chunk_emb in zip(state["process_text_chunks"], chunk_embeddings):
+        scores = np.dot(filtered_embeddings, chunk_emb)
+        for idx, score in enumerate(scores):
+            if score >= threshold:
+                mappings.append((chunk, filtered_docs[idx], score))
+    
+    state["mappings"] = mappings
+    print(f"Mapped {len(mappings)} chunks with similarity above threshold {threshold}.")
+    return state
+
+# Step 7: Build the Workflow
 def create_agent():
     workflow = StateGraph(AgentState)
     
     # Add nodes
-    workflow.add_node("load_excel_data", load_excel_data)
-    workflow.add_node("prepare_documents", prepare_documents)
+    workflow.add_node("load_and_chunk_process", load_and_chunk_process)
     workflow.add_node("initialize_embeddings", initialize_embeddings)
-    workflow.add_node("build_vector_store", build_vector_store)
+    workflow.add_node("generate_chunk_embeddings", generate_chunk_embeddings)
+    workflow.add_node("load_vector_store", load_vector_store)
+    workflow.add_node("map_with_metadata", map_with_metadata)
     
     # Define edges
-    workflow.add_edge("load_excel_data", "prepare_documents")
-    workflow.add_edge("prepare_documents", "initialize_embeddings")
-    workflow.add_edge("initialize_embeddings", "build_vector_store")
-    workflow.add_edge("build_vector_store", END)
+    workflow.add_edge("load_and_chunk_process", "initialize_embeddings")
+    workflow.add_edge("initialize_embeddings", "generate_chunk_embeddings")
+    workflow.add_edge("generate_chunk_embeddings", "load_vector_store")
+    workflow.add_edge("load_vector_store", "map_with_metadata")
+    workflow.add_edge("map_with_metadata", END)
     
     # Set entry point
-    workflow.set_entry_point("load_excel_data")
+    workflow.set_entry_point("load_and_chunk_process")
     
     return workflow.compile()
 
 # Main Execution
 def main():
+    # User-provided metadata
+    user_metadata = {"Category": "Security", "Status": "Active"}
+    
     # Create and run the agent
     agent = create_agent()
     initial_state = {
-        "excel_data": None,
+        "process_text_chunks": [],
+        "user_metadata": user_metadata,
         "vector_store": None,
-        "context_column": "",
-        "metadata_columns": [],
-        "documents": []
+        "chunk_embeddings": None,
+        "mappings": []
     }
     
     result = agent.invoke(initial_state)
     
-    # Optional: Test the vector store (add querying logic here if needed)
-    vector_store = result["vector_store"]
-    # Example: query = vector_store.similarity_search("unauthorized access", k=2, filter={"Status": "Active"})
-    # print("Query Results:", query)
+    # Display results
+    if result["mappings"]:
+        print("\nMapped Sections:")
+        for chunk, doc, score in result["mappings"]:
+            print(f"Process Chunk: {chunk}")
+            print(f"Matched Document: {doc.page_content}, Score: {score:.4f}")
+            print(f"Metadata: {doc.metadata}")
+            print("---")
+    else:
+        print("No relevant mappings found.")
 
 if __name__ == "__main__":
-    # Set Azure OpenAI environment variables (optional, if not hardcoded)
     os.environ["AZURE_OPENAI_ENDPOINT"] = "YOUR_AZURE_ENDPOINT"
     os.environ["AZURE_OPENAI_API_KEY"] = "YOUR_API_KEY"
     
     main()
-
-
-def query_vector_store(state: AgentState) -> AgentState:
-    query = "risk"
-    results = state["vector_store"].similarity_search(query, k=2, filter={"Status": "Active"})
-    state["query_results"] = results
-    print("Query Results:", results)
-    return state
-workflow.add_node("query_vector_store", query_vector_store)
-workflow.add_edge("build_vector_store", "query_vector_store")
