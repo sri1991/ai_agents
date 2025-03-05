@@ -1,0 +1,121 @@
+import pandas as pd
+from langchain.docstore.document import Document
+from langchain.vectorstores import FAISS
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Dict
+from openai import AzureOpenAI  # Updated to use openai for embeddings
+import os
+import numpy as np
+
+# Step 1: Define the Agent State
+class AgentState(TypedDict):
+    excel_data: pd.DataFrame  # Raw Excel data
+    vector_store: FAISS       # FAISS vector store
+    context_column: str       # Column used as context for embedding
+    metadata_columns: list    # Columns to use as metadata
+    documents: list           # Processed documents
+
+# Step 2: Load Excel Data
+def load_excel_data(state: AgentState) -> AgentState:
+    # Load the Excel file
+    df = pd.read_excel("data.xlsx")
+    state["excel_data"] = df
+    state["context_column"] = "Description"  # Define the context column
+    state["metadata_columns"] = ["Category", "Status", "Date"]  # Define metadata columns
+    print(f"Loaded Excel with {len(df)} rows.")
+    return state
+
+# Step 3: Convert Excel to Documents with Context and Metadata
+def prepare_documents(state: AgentState) -> AgentState:
+    documents = []
+    for _, row in state["excel_data"].iterrows():
+        context = row[state["context_column"]]  # Context column for embedding
+        metadata = {col: row[col] for col in state["metadata_columns"]}  # Metadata columns
+        documents.append(Document(page_content=context, metadata=metadata))
+    state["documents"] = documents
+    print(f"Prepared {len(documents)} documents with context from '{state['context_column']}'.")
+    return state
+
+# Step 4: Initialize Azure OpenAI Embedding Client
+def initialize_embeddings(state: AgentState) -> AgentState:
+    # Azure OpenAI credentials (replace with your values)
+    client = AzureOpenAI(
+        azure_endpoint="YOUR_AZURE_ENDPOINT",
+        api_key="YOUR_API_KEY",
+        api_version="2023-05-15",  # Adjust based on your deployment
+        azure_deployment="YOUR_EMBEDDING_DEPLOYMENT_NAME"  # e.g., "text-embedding-ada-002"
+    )
+    state["embedding_client"] = client
+    print("Initialized Azure OpenAI embedding client.")
+    return state
+
+# Step 5: Generate Embeddings and Build FAISS Vector Store
+def build_vector_store(state: AgentState) -> AgentState:
+    client = state["embedding_client"]
+    documents = state["documents"]
+    
+    # Generate embeddings for the context column
+    texts = [doc.page_content for doc in documents]
+    response = client.embeddings.create(input=texts, model="YOUR_EMBEDDING_DEPLOYMENT_NAME")
+    embeddings = np.array([item.embedding for item in response.data])
+    
+    # Create FAISS index
+    dimension = embeddings.shape[1]
+    index = FAISS.IndexFlatL2(dimension)
+    index.add(embeddings)
+    
+    # Build FAISS vector store with LangChain
+    vector_store = FAISS.from_documents(
+        documents=documents,
+        embedding=lambda x: embeddings[list(texts).index(x)]
+    )
+    state["vector_store"] = vector_store
+    print(f"Built FAISS vector store with {len(documents)} vectors.")
+    return state
+
+# Step 6: Build the Workflow
+def create_agent():
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("load_excel_data", load_excel_data)
+    workflow.add_node("prepare_documents", prepare_documents)
+    workflow.add_node("initialize_embeddings", initialize_embeddings)
+    workflow.add_node("build_vector_store", build_vector_store)
+    
+    # Define edges
+    workflow.add_edge("load_excel_data", "prepare_documents")
+    workflow.add_edge("prepare_documents", "initialize_embeddings")
+    workflow.add_edge("initialize_embeddings", "build_vector_store")
+    workflow.add_edge("build_vector_store", END)
+    
+    # Set entry point
+    workflow.set_entry_point("load_excel_data")
+    
+    return workflow.compile()
+
+# Main Execution
+def main():
+    # Create and run the agent
+    agent = create_agent()
+    initial_state = {
+        "excel_data": None,
+        "vector_store": None,
+        "context_column": "",
+        "metadata_columns": [],
+        "documents": []
+    }
+    
+    result = agent.invoke(initial_state)
+    
+    # Optional: Test the vector store (add querying logic here if needed)
+    vector_store = result["vector_store"]
+    # Example: query = vector_store.similarity_search("unauthorized access", k=2, filter={"Status": "Active"})
+    # print("Query Results:", query)
+
+if __name__ == "__main__":
+    # Set Azure OpenAI environment variables (optional, if not hardcoded)
+    os.environ["AZURE_OPENAI_ENDPOINT"] = "YOUR_AZURE_ENDPOINT"
+    os.environ["AZURE_OPENAI_API_KEY"] = "YOUR_API_KEY"
+    
+    main()
