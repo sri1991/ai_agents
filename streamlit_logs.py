@@ -1,81 +1,48 @@
 import streamlit as st
-import logging
 import time
-from io import StringIO
 
-# Custom Streamlit logging handler
-class StreamlitHandler(logging.Handler):
-    def __init__(self, update_logs_callback):
-        super().__init__()
-        self.update_logs_callback = update_logs_callback
-        self.logs = []
-
-    def emit(self, record):
-        log_entry = self.format(record)
-        self.logs.append(log_entry)
-        self.update_logs_callback(self.logs)
-
-# Configure logging
-log_buffer = StringIO()
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(log_buffer)]
-)
-logger = logging.getLogger(__name__)
-
-# Streamlit app
-st.title("Streamlit App with Real-Time Logs")
-
-# Session state to store logs and task status
-if 'logs' not in st.session_state:
-    st.session_state.logs = []
+# Session state to track progress and messages
+if 'progress' not in st.session_state:
+    st.session_state.progress = 0
+if 'message' not in st.session_state:
+    st.session_state.message = "Waiting to start..."
 if 'task_running' not in st.session_state:
     st.session_state.task_running = False
 
-# Callback to update logs in session state
-def update_logs(new_logs):
-    st.session_state.logs = new_logs
-    st.experimental_rerun()
+# Streamlit app
+st.title("Simple Progress App")
 
-# Add custom handler to logger
-if not any(isinstance(handler, StreamlitHandler) for handler in logger.handlers):
-    streamlit_handler = StreamlitHandler(update_logs)
-    logger.addHandler(streamlit_handler)
-
-# Display logs
-log_display = st.text_area("Task Logs", "\n".join(st.session_state.logs), height=200)
-
-# Simulate a task with logging
-def run_task():
-    st.session_state.task_running = True
-    logger.info("Starting task...")
-    
-    items = ["Item 1", "Item 2", "Item 3", "Item 4", "Item 5"]
-    total_items = len(items)
-    
-    for i, item in enumerate(items):
-        time.sleep(1)  # Simulate processing time
-        progress = ((i + 1) / total_items) * 100
-        logger.info(f"Processing {item} ({i + 1}/{total_items}) - {progress:.1f}%")
-    
-    logger.info("Task completed! 100%")
-    st.session_state.task_running = False
+# Display current message and progress bar
+st.write(st.session_state.message)
+progress_bar = st.progress(st.session_state.progress / 100)
 
 # Button to start the task
 if st.button("Start Task") and not st.session_state.task_running:
-    st.session_state.logs = []  # Clear previous logs
-    run_task()
+    st.session_state.task_running = True
+    st.session_state.progress = 0
+    st.session_state.message = "Task starting..."
+    st.experimental_rerun()
 
-# Progress bar based on log messages
-if st.session_state.logs:
-    latest_log = st.session_state.logs[-1]
-    if "%" in latest_log:
-        progress = float(latest_log.split("%")[0].split()[-1])
-        st.progress(progress / 100)
+# Simulate a task and update progress
+if st.session_state.task_running:
+    items = ["Step 1", "Step 2", "Step 3", "Step 4", "Step 5"]
+    total_steps = len(items)
+
+    for i, step in enumerate(items):
+        if not st.session_state.task_running:
+            break
+        st.session_state.progress = ((i + 1) / total_steps) * 100
+        st.session_state.message = f"Processing {step} ({i + 1}/{total_steps})"
+        st.experimental_rerun()
+        time.sleep(1)  # Simulate work
+
+    if st.session_state.progress >= 100:
+        st.session_state.message = "Task completed!"
+        st.session_state.task_running = False
+        st.experimental_rerun()
 
 # Stop button
 if st.button("Stop Task") and st.session_state.task_running:
     st.session_state.task_running = False
-    logger.warning("Task stopped by user!")
+    st.session_state.message = "Task stopped by user!"
     st.experimental_rerun()
